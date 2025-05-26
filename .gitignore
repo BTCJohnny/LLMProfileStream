@@ -1,3 +1,14 @@
-.json
-.csv
-.duckdb
+# Ignore data files in the data/ and output/ folders
+data/*.json
+data/*.csv
+output/*.json
+output/*.csv
+tests/*.py
+
+# Ignore all .duckdb files everywhere
+*.duckdb
+*.md
+
+# Never ignore important config files
+!package.json
+!config.json

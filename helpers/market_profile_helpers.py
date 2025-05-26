@@ -7,12 +7,18 @@ from typing import Optional, Dict
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
 import json
+import io
+import sys
+# Import the excess detection helper
+from .excess_detection_helper import detect_excess_from_ohlcv
 
 # --- Market Profile Calculation and Shape Detection ---
 def calculate_market_profile(
     df_group: pd.DataFrame,
     percent: float = 0.7,
-    tick_size: float = 0.25
+    tick_size: float = 0.25,
+    recent_profiles: list = None,
+    excess_detection: bool = True  # New parameter to control excess detection
 ) -> Optional[Dict]:
     """
     Calculate detailed ES market profile from OHLCV data
@@ -20,8 +26,10 @@ def calculate_market_profile(
       - df_group: pd.DataFrame with 'high', 'low', 'open', 'close', 'volume' columns (1-min bars)
       - percent (default 70%): volume share for Value Area
       - tick_size: minimum price increment (ES=0.25)
+      - recent_profiles: list of recent profiles for HVN/LVN validation (optional)
+      - excess_detection: whether to run excess detection (default True)
     Returns:
-      - dict with VAH, VAL, VPOC, normalized profile, shape stats, etc.
+      - dict with VAH, VAL, VPOC, normalized profile, shape stats, HVNs, LVNs, excess analysis, etc.
     """
     if df_group.empty:
         return None
@@ -87,6 +95,33 @@ def calculate_market_profile(
         skewness = 0
     peak_vol_ratio = max(norm_vols) if total_vol > 0 else 0
     pattern = detect_profile_shape(raw_dist)
+    
+    # --- NEW: LuxAlgo HVN/LVN Detection ---
+    try:
+        luxalgo_results = detect_hvn_lvn_peaks_and_troughs(
+            profile_distribution=raw_dist,
+            peak_detection_percent=0.09,
+            trough_detection_percent=0.07,
+            volume_threshold_percent=0.01,
+            max_peaks=5,
+            max_troughs=5
+        )
+        hvns_luxalgo = [hvn['price'] for hvn in luxalgo_results['hvns']]
+        lvns_luxalgo = [lvn['price'] for lvn in luxalgo_results['lvns']]
+        hvns_detailed_luxalgo = luxalgo_results['hvns']
+        lvns_detailed_luxalgo = luxalgo_results['lvns']
+        luxalgo_metadata = luxalgo_results['metadata']
+    except Exception as e:
+        print(f"⚠️ LuxAlgo HVN/LVN detection failed: {e}")
+        hvns_luxalgo = []
+        lvns_luxalgo = []
+        hvns_detailed_luxalgo = []
+        lvns_detailed_luxalgo = []
+        luxalgo_metadata = {}
+    
+    # --- Calculate VWAP ---
+    vwap = compute_vwap(df_group)
+    
     result = {
         'start_time': df_group.index[0],
         'end_time': df_group.index[-1],
@@ -106,9 +141,177 @@ def calculate_market_profile(
         'kurtosis': kurtosis,
         'profile_shape': pattern,
         'tick_size': tick_size,
-        'bin_count': channel_count
+        'bin_count': channel_count,
+        # --- LuxAlgo Method Results ---
+        'hvns': hvns_luxalgo,
+        'lvns': lvns_luxalgo,
+        'hvns_detailed': hvns_detailed_luxalgo,
+        'lvns_detailed': lvns_detailed_luxalgo,
+        'hvn_lvn_metadata_luxalgo': luxalgo_metadata,
+        'vwap': vwap  # Add VWAP calculation
     }
+
+    # --- Excess Detection Integration ---
+    if excess_detection:
+        # Convert the DataFrame to a list of dicts for the excess detection helper
+        minute_bars = df_group.to_dict('records')
+        # Call the excess detection function and merge results into the profile dict
+        excess_analysis = detect_excess_from_ohlcv(result, minute_bars)
+        result.update(excess_analysis)
+        # Now result contains all excess fields (excess_high, excess_low, etc.)
+
     return result
+
+# --- NEW: LuxAlgo Peaks and Troughs Detection ---
+def detect_hvn_lvn_peaks_and_troughs(
+    profile_distribution: dict,
+    peak_detection_percent: float = 0.09,  # 9% like LuxAlgo default
+    trough_detection_percent: float = 0.07,  # 7% like LuxAlgo default  
+    volume_threshold_percent: float = 0.01,  # 1% minimum volume threshold
+    max_peaks: int = 5,
+    max_troughs: int = 5,
+    min_distance: float = 1.0  # Minimum price distance between nodes
+) -> dict:
+    """
+    Detect HVNs (peaks) and LVNs (troughs) using LuxAlgo's proven algorithm.
+    Filters out nodes that are too close together (within min_distance).
+    
+    Args:
+        profile_distribution: Price -> volume mapping
+        peak_detection_percent: % of profile rows to use for peak detection context
+        trough_detection_percent: % of profile rows to use for trough detection context
+        volume_threshold_percent: Minimum volume % of max to be considered
+        max_peaks: Maximum HVNs to return
+        max_troughs: Maximum LVNs to return
+        min_distance: Minimum price distance between nodes
+    """
+    
+    if not profile_distribution:
+        return {'hvns': [], 'lvns': [], 'metadata': {}}
+    
+    # --- FIX: Normalize all keys to float for consistent access ---
+    float_price_to_volume = {float(p): v for p, v in profile_distribution.items()}
+    sorted_prices = sorted(float_price_to_volume.keys())
+    volumes = [float_price_to_volume[p] for p in sorted_prices]
+    # --- END FIX ---
+    
+    if not volumes:
+        return {'hvns': [], 'lvns': [], 'metadata': {}}
+    
+    max_volume = max(volumes)
+    volume_threshold = max_volume * volume_threshold_percent
+    profile_rows = len(volumes)
+    
+    # Calculate detection windows (like PineScript's peaksNumberOfNodes)
+    peak_window = max(1, int(profile_rows * peak_detection_percent))
+    trough_window = max(1, int(profile_rows * trough_detection_percent))
+    
+    hvns = []  # Peaks
+    lvns = []  # Troughs
+    
+    # === HVN (Peak) Detection ===
+    for i in range(peak_window, profile_rows - peak_window):
+        current_volume = volumes[i]
+        current_price = sorted_prices[i]
+        
+        # Skip if below volume threshold
+        if current_volume < volume_threshold:
+            continue
+            
+        # Check if it's a peak (higher than all neighbors in window)
+        is_peak = True
+        
+        # Check preceding nodes
+        for j in range(i - peak_window, i):
+            if current_volume <= volumes[j]:
+                is_peak = False
+                break
+        
+        if not is_peak:
+            continue
+            
+        # Check succeeding nodes  
+        for j in range(i + 1, i + peak_window + 1):
+            if current_volume <= volumes[j]:
+                is_peak = False
+                break
+        
+        if is_peak:
+            hvns.append({
+                'price': current_price,
+                'volume': current_volume,
+                'confidence': current_volume / max_volume,  # Relative strength
+                'window_size': peak_window,
+                'node_type': 'peak',
+                'detection_method': 'luxalgo_peaks'
+            })
+    
+    # === LVN (Trough) Detection ===
+    for i in range(trough_window, profile_rows - trough_window):
+        current_volume = volumes[i]
+        current_price = sorted_prices[i]
+        
+        # For troughs, we want low volume relative to max
+        if current_volume > max_volume * 0.5:  # Skip if too high volume
+            continue
+            
+        # Check if it's a trough (lower than all neighbors in window)
+        is_trough = True
+        
+        # Check preceding nodes
+        for j in range(i - trough_window, i):
+            if current_volume >= volumes[j]:
+                is_trough = False
+                break
+        
+        if not is_trough:
+            continue
+            
+        # Check succeeding nodes
+        for j in range(i + 1, i + trough_window + 1):
+            if current_volume >= volumes[j]:
+                is_trough = False
+                break
+        
+        if is_trough:
+            lvns.append({
+                'price': current_price,
+                'volume': current_volume,
+                'confidence': 1.0 - (current_volume / max_volume),  # Lower volume = higher confidence for LVN
+                'window_size': trough_window,
+                'node_type': 'trough',
+                'detection_method': 'luxalgo_troughs'
+            })
+    
+    # Sort and limit results
+    hvns.sort(key=lambda x: x['confidence'], reverse=True)
+    lvns.sort(key=lambda x: x['confidence'], reverse=True)
+    
+    # After sorting and before limiting, filter by min_distance
+    def filter_by_min_distance(nodes, min_distance):
+        filtered = []
+        for node in nodes:
+            if all(abs(node['price'] - f['price']) >= min_distance for f in filtered):
+                filtered.append(node)
+        return filtered
+    hvns = filter_by_min_distance(hvns, min_distance)
+    lvns = filter_by_min_distance(lvns, min_distance)
+    # Now limit to max_peaks/max_troughs
+    hvns = hvns[:max_peaks]
+    lvns = lvns[:max_troughs]
+    
+    return {
+        'hvns': hvns,
+        'lvns': lvns,
+        'metadata': {
+            'peak_window': peak_window,
+            'trough_window': trough_window,
+            'volume_threshold': volume_threshold,
+            'max_volume': max_volume,
+            'total_price_levels': profile_rows,
+            'detection_method': 'luxalgo_peaks_troughs'
+        }
+    }
 
 def detect_profile_shape(raw_dist: dict) -> str:
     """
@@ -249,98 +452,6 @@ def detect_poor_high_low(profile_distribution, high_price, low_price, threshold=
         'poor_low': poor_low
     }
 
-# --- HVN/LVN Extraction ---
-def extract_key_volume_nodes(profile_distribution: dict, 
-                           hvn_count: int = 2,
-                           lvn_exclusion_pct: float = 0.25,
-                           lvn_min_separation: int = 3,
-                           lvn_cluster_size: int = 2,
-                           min_vpoc_distance: float = 5.0) -> dict:
-    """
-    Extract HVNs and LVNs using a cluster-based approach.
-    Args:
-        profile_distribution (dict): Price -> volume mapping
-        hvn_count (int): Number of HVNs to identify (excluding VPOC)
-        lvn_exclusion_pct (float): % of price range to exclude from top/bottom
-        lvn_min_separation (int): Minimum price levels between LVNs
-        lvn_cluster_size (int): Minimum price levels an LVN must span
-        min_vpoc_distance (float): Minimum distance from VPOC for HVNs
-    Returns:
-        dict: {'hvns': [prices], 'lvns': [prices]}
-    """
-    if not profile_distribution:
-        return {'hvns': [], 'lvns': []}
-    sorted_prices = sorted(profile_distribution.keys())
-    sorted_volumes = sorted(profile_distribution.items(), key=lambda x: x[1], reverse=True)
-    vpoc_price = sorted_volumes[0][0]
-    vpoc_volume = sorted_volumes[0][1]
-    price_range = float(sorted_prices[-1]) - float(sorted_prices[0])
-    exclude_top = float(sorted_prices[-1]) - (price_range * lvn_exclusion_pct)
-    exclude_bottom = float(sorted_prices[0]) + (price_range * lvn_exclusion_pct)
-    hvn_candidates = []
-    current_cluster = {'prices': [], 'total_volume': 0.0, 'avg_price': 0.0}
-    for price, volume in sorted_volumes[1:]:  # Skip VPOC
-        price_float = float(price)
-        if abs(price_float - float(vpoc_price)) < min_vpoc_distance:
-            continue
-        if not current_cluster['prices'] or \
-           abs(price_float - current_cluster['avg_price']) <= 2.0:
-            current_cluster['prices'].append(price_float)
-            current_cluster['total_volume'] += volume
-            current_cluster['avg_price'] = sum(current_cluster['prices']) / len(current_cluster['prices'])
-        else:
-            if current_cluster['prices']:
-                hvn_candidates.append(current_cluster)
-            current_cluster = {
-                'prices': [price_float],
-                'total_volume': volume,
-                'avg_price': price_float
-            }
-    if current_cluster['prices']:
-        hvn_candidates.append(current_cluster)
-    hvn_candidates.sort(key=lambda x: x['total_volume'], reverse=True)
-    hvns = [round(cluster['avg_price'], 2) for cluster in hvn_candidates[:hvn_count]]
-    lvn_candidates = []
-    current_cluster = {'prices': [], 'total_volume': 0.0, 'avg_price': 0.0}
-    for price in sorted_prices:
-        price_float = float(price)
-        volume = profile_distribution[price]
-        if price_float < exclude_bottom or price_float > exclude_top:
-            continue
-        if volume < 0.4 * vpoc_volume:
-            if not current_cluster['prices'] or \
-               abs(price_float - current_cluster['prices'][-1]) <= 1.5:
-                current_cluster['prices'].append(price_float)
-                current_cluster['total_volume'] += volume
-                current_cluster['avg_price'] = sum(current_cluster['prices']) / len(current_cluster['prices'])
-            else:
-                if len(current_cluster['prices']) >= lvn_cluster_size:
-                    lvn_candidates.append(current_cluster)
-                current_cluster = {
-                    'prices': [price_float],
-                    'total_volume': volume,
-                    'avg_price': price_float
-                }
-        else:
-            if current_cluster['prices'] and len(current_cluster['prices']) >= lvn_cluster_size:
-                lvn_candidates.append(current_cluster)
-            current_cluster = {'prices': [], 'total_volume': 0.0, 'avg_price': 0.0}
-    if current_cluster['prices'] and len(current_cluster['prices']) >= lvn_cluster_size:
-        lvn_candidates.append(current_cluster)
-    lvn_candidates.sort(key=lambda x: x['total_volume'] / len(x['prices']))
-    lvns = []
-    for cluster in lvn_candidates:
-        mid_price = round(cluster['avg_price'], 2)
-        if not lvns or all(abs(mid_price - existing) >= lvn_min_separation 
-                          for existing in lvns):
-            lvns.append(mid_price)
-            if len(lvns) == 2:
-                break
-    return {
-        'hvns': hvns,
-        'lvns': lvns
-    }
-
 # --- Untested VPOC Tracker ---
 def track_untested_vpocs(profiles, threshold=0.0, max_untested=3):
     """
@@ -402,7 +513,6 @@ def label_vpoc_relative(profile: dict) -> str:
     except Exception as e:
         # Logging or debugging can be added here
         return "unknown"
-
 
 def compute_summary_features(profiles: list) -> list:
     """
@@ -510,13 +620,25 @@ def compute_summary_features(profiles: list) -> list:
             "previous_vah": prev.get("vah", None),
             "previous_val": prev.get("val", None),
             "previous_vpoc": prev.get("vpoc", None),
+            # --- Excess detection fields ---
+            "excess_high": cur.get("excess_high", None),
+            "excess_low": cur.get("excess_low", None),
+            "confidence_high": cur.get("confidence_high", None),
+            "confidence_low": cur.get("confidence_low", None),
+            "rejection_high": cur.get("rejection_high", None),
+            "rejection_low": cur.get("rejection_low", None),
+            "volume_excess_high": cur.get("volume_excess_high", None),
+            "volume_excess_low": cur.get("volume_excess_low", None),
+            "time_excess_high": cur.get("time_excess_high", None),
+            "time_excess_low": cur.get("time_excess_low", None)
         })
     return output
 
 def save_profile_analysis(symbol: str, timeframe: str, features: list, db_path: str = None) -> None:
     """
     Save all processed profile analyses into a DuckDB file.
-    Creates or updates the table if necessary.
+    Creates or updates the symbol-specific table if necessary.
+    Table name format: profile_analysis_{symbol} (e.g., profile_analysis_ESS)
     The table schema includes all relevant summary/labeling fields for LLM and analysis.
     """
     import os
@@ -526,9 +648,10 @@ def save_profile_analysis(symbol: str, timeframe: str, features: list, db_path: 
     if db_path is None:
         db_path = os.path.join(ROOT_DIR, "profiles_summary.duckdb")
 
-    # Create the table if it does not exist.
-    create_table_query = """
-    CREATE TABLE IF NOT EXISTS profile_analysis (
+    # Create the table if it does not exist - include symbol in table name
+    table_name = f"profile_analysis_{symbol}"
+    create_table_query = f"""
+    CREATE TABLE IF NOT EXISTS {table_name} (
         symbol TEXT,
         timeframe TEXT,
         timestamp TIMESTAMP,
@@ -559,7 +682,18 @@ def save_profile_analysis(symbol: str, timeframe: str, features: list, db_path: 
         mid DOUBLE,
         previous_vah DOUBLE,
         previous_val DOUBLE,
-        previous_vpoc DOUBLE
+        previous_vpoc DOUBLE,
+        -- Excess detection fields
+        excess_high BOOLEAN,
+        excess_low BOOLEAN,
+        confidence_high DOUBLE,
+        confidence_low DOUBLE,
+        rejection_high BOOLEAN,
+        rejection_low BOOLEAN,
+        volume_excess_high BOOLEAN,
+        volume_excess_low BOOLEAN,
+        time_excess_high BOOLEAN,
+        time_excess_low BOOLEAN
     )
     """
 
@@ -599,10 +733,21 @@ def save_profile_analysis(symbol: str, timeframe: str, features: list, db_path: 
             row_previous_vah = feature.get("previous_vah", None)
             row_previous_val = feature.get("previous_val", None)
             row_previous_vpoc = feature.get("previous_vpoc", None)
+            # --- Excess detection fields ---
+            row_excess_high = feature.get("excess_high", None)
+            row_excess_low = feature.get("excess_low", None)
+            row_confidence_high = feature.get("confidence_high", None)
+            row_confidence_low = feature.get("confidence_low", None)
+            row_rejection_high = feature.get("rejection_high", None)
+            row_rejection_low = feature.get("rejection_low", None)
+            row_volume_excess_high = feature.get("volume_excess_high", None)
+            row_volume_excess_low = feature.get("volume_excess_low", None)
+            row_time_excess_high = feature.get("time_excess_high", None)
+            row_time_excess_low = feature.get("time_excess_low", None)
 
             # Remove any existing record with the same symbol, timeframe, and timestamp
-            delete_query = """
-            DELETE FROM profile_analysis
+            delete_query = f"""
+            DELETE FROM {table_name}
             WHERE symbol = ?
               AND timeframe = ?
               AND timestamp = ?
@@ -610,8 +755,8 @@ def save_profile_analysis(symbol: str, timeframe: str, features: list, db_path: 
             con.execute(delete_query, (row_symbol, row_timeframe, row_timestamp))
 
             # Insert the new record
-            insert_query = """
-            INSERT INTO profile_analysis (
+            insert_query = f"""
+            INSERT INTO {table_name} (
                 symbol,
                 timeframe,
                 timestamp,
@@ -642,8 +787,18 @@ def save_profile_analysis(symbol: str, timeframe: str, features: list, db_path: 
                 mid,
                 previous_vah,
                 previous_val,
-                previous_vpoc
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                previous_vpoc,
+                excess_high,
+                excess_low,
+                confidence_high,
+                confidence_low,
+                rejection_high,
+                rejection_low,
+                volume_excess_high,
+                volume_excess_low,
+                time_excess_high,
+                time_excess_low
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """
             con.execute(insert_query, (
                 row_symbol,
@@ -676,5 +831,121 @@ def save_profile_analysis(symbol: str, timeframe: str, features: list, db_path: 
                 row_mid,
                 row_previous_vah,
                 row_previous_val,
-                row_previous_vpoc
-            )) 
+                row_previous_vpoc,
+                row_excess_high,
+                row_excess_low,
+                row_confidence_high,
+                row_confidence_low,
+                row_rejection_high,
+                row_rejection_low,
+                row_volume_excess_high,
+                row_volume_excess_low,
+                row_time_excess_high,
+                row_time_excess_low
+            ))
+
+def to_py_bool(val):
+    """Convert numpy.bool_ or pandas boolean to native Python bool (or None)."""
+    import numpy as np
+    if val is None or isinstance(val, bool):
+        return val
+    if isinstance(val, np.bool_):
+        return bool(val)
+    return bool(val)
+
+def build_summary_feature(profile: dict, prev_profile: dict | None = None, *, timeframe: str = "") -> dict:
+    """Build a summary-feature dict that matches the database schema.
+
+    Parameters
+    ----------
+    profile : dict
+        The current profile produced by `generate_full_profile`.
+    prev_profile : dict | None, optional
+        Previous profile for context, by default None.
+    timeframe : str, optional
+        Timeframe label (e.g. "15min"), by default "".
+
+    Returns
+    -------
+    dict
+        A dict whose keys exactly match the columns in `save_profile_analysis`.
+    """
+    # Helper safe-get
+    g = profile.get
+    prev = prev_profile or {}
+
+    summary = {
+        "timestamp": g("start_time"),
+        "timeframe": timeframe,
+        "vah": g("vah"),
+        "val": g("val"),
+        "vpoc": g("vpoc"),
+        "profile_high": g("high"),
+        "profile_low": g("low"),
+        "close": g("close"),
+        "profile_mid": (g("vah") + g("val")) / 2 if (g("vah") is not None and g("val") is not None) else None,
+        "vah_val_width": (g("vah") - g("val")) if (g("vah") is not None and g("val") is not None) else None,
+        "volume": g("volume"),
+        "skewness": g("skewness"),
+        "kurtosis": g("kurtosis"),
+        "profile_shape": g("profile_shape"),
+        "value_area_trend": None,
+        "value_area_overlap_ratio": None,
+        "value_area_width_change": None,
+        "vpoc_relative_location": None,
+        "open_vs_prev_value_area": g("open_prev_profile"),
+        "close_vs_value_area": None,
+        "pattern_open_close_behavior": None,
+        "open": g("open"),
+        "hvns": json.dumps(g("hvns", [])),
+        "lvns": json.dumps(g("lvns", [])),
+        "untested_vpocs": json.dumps(g("untested_vpocs", [])),
+        "vwap": g("vwap"),
+        "mid": g("mid"),
+        "previous_vah": prev.get("vah"),
+        "previous_val": prev.get("val"),
+        "previous_vpoc": prev.get("vpoc"),
+        "excess_high": to_py_bool(g("excess_high")),
+        "excess_low": to_py_bool(g("excess_low")),
+        "confidence_high": g("confidence_high"),
+        "confidence_low": g("confidence_low"),
+        "rejection_high": to_py_bool(g("rejection_high")),
+        "rejection_low": to_py_bool(g("rejection_low")),
+        "volume_excess_high": to_py_bool(g("volume_excess_high")),
+        "volume_excess_low": to_py_bool(g("volume_excess_low")),
+        "time_excess_high": to_py_bool(g("time_excess_high")),
+        "time_excess_low": to_py_bool(g("time_excess_low")),
+        # LLM pattern placeholder
+        "pattern_name": "Current Profile",
+        "pattern_confidence": 1.0,
+        "pattern_notes": "Live profile data",
+        "context_open": None,
+    }
+    return summary
+
+def save_summary_to_csv(symbol: str, timeframe: str, summary: dict, data_dir: str):
+    """Append a summary-feature row to a CSV, creating it with headers if needed."""
+    import pandas as pd
+    import os
+    filename = os.path.join(data_dir, f"{symbol}_{timeframe}_profile_analysis.csv")
+    df_row = pd.DataFrame([summary])
+    header_needed = not os.path.exists(filename)
+    df_row.to_csv(filename, mode="a", index=False, header=header_needed)
+
+def append_summary_to_json(symbol: str, timeframe: str, summary: dict, data_dir: str):
+    """Append a summary-feature dict to a JSON file containing a list of summaries."""
+    import os, json
+    path = os.path.join(data_dir, f"{symbol}_{timeframe}_profile_analysis.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as jf:
+                existing = json.load(jf)
+                if not isinstance(existing, list):
+                    existing = [existing]
+        except Exception:
+            existing = []
+    else:
+        existing = []
+    existing.append(summary)
+    with open(path, "w") as jf:
+        json.dump(existing, jf, indent=2, default=str)
