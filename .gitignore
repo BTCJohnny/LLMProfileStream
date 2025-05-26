@@ -4,6 +4,7 @@ data/*.csv
 output/*.json
 output/*.csv
 tests/*.py
+config/river-dynamo-445508-m1-ac85f6c3600a.json
 
 # Ignore all .duckdb files everywhere
 *.duckdb
